@@ -19,16 +19,21 @@ epoch.
 This program has been tested with linux.jpg to ensure that transfer of binary
 files works as expected.
 
-## Difference between this and PA2/PA3
+## Difference between this and the assignment requirements for PA2/PA3
+
+For the HTTP server / client in PA2/PA3, you need to handle more complex headers.
 
 In this example, the "header" is extremely simple:
   - for client requests, the header is just a filename followed by a delimiter
   - for server responses, the header is just an integer followed by a delimiter
 
-For the HTTP server / client in PA2/PA3, you need to handle more complex
-headers, and also need to be able to handle offsets, MIME types, and other
-information in the URL. This sample also does not properly prevent the
-client from escaping from the server root / other features.
+Other functionality that's missing
+- handling offset / length in request URL
+- setting the server root and preventing the client from escaping
+- MIME types
+- logging
+- etc....
+
 
 ## Instructions
 
