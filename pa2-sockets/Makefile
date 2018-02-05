@@ -6,7 +6,7 @@ OBJS := $(addsuffix .o,$(basename $(SRCS)))
 DEPS := $(OBJS:.o=.d)
 
 CXXFLAGS=-g -MMD -MP -std=c++11 -Wall -Werror -pedantic
-LDLIBS ?= -lglog -lgflags -lboost_system -lboost_thread
+LDLIBS ?= -lglog -lgflags -lboost_system -lboost_thread -lpthread
 
 $(TARGET): $(OBJS)
 	$(CXX) $(LDFLAGS) $(OBJS) -o $@ $(LOADLIBES) $(LDLIBS)
