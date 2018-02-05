@@ -24,7 +24,7 @@ Run client:
 ./pa2 -port {PORT_NUMBER} -message={MESSAGE}
 ```
 
-## Header mode:
+## Header mode
 
 You can run the client and server in //header mode// by including
 `--header_mode` in commands (shown below, by default header mode is disabled).
