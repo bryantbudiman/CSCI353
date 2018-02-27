@@ -8,27 +8,80 @@
 
 #include "SocketUtils.h"
 
+// The following flag allows us to artificially slow down the transfer
+DEFINE_int32(
+    send_delay_ms, 10,
+    "Number of milliseconds to wait between sending each byte of the file");
+
 Server::Server()
-  : nextClientID_(1) {}
+  : nextClientID_(1),
+    acceptor_(ioService_) {}
 
-void Server::run(int32_t port) {
-  // start an IO service, accept connections on all addresses
-  boost::asio::io_service ioService;
-  boost::asio::ip::tcp::acceptor acceptor(
-      ioService,
-      boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), port));
+void Server::run(const boost::asio::ip::tcp::endpoint& endpoint) {
+  // open the acceptor and bind it to our endpoint (All V4 addresses on system)
+  acceptor_.open(endpoint.protocol());
+  acceptor_.bind(endpoint);
+  acceptor_.listen();
 
-  // keep processing connections forever
-  for (;;) {
-    // setup a socket and wait on a client connection
-    // we'll block on acceptor.accept(socket) until a new client arrives...
-    boost::asio::ip::tcp::socket socket(ioService);
+  // keep processing connections until the acceptor is shutdown
+  LOG(INFO) << "Entering connection acceptance loop";
+  while (acceptor_.is_open()) {
+    // Setup a socket and wait on a client connection
+    //
+    // We'll use `acceptor_.async_accept()` to setup a lambda function that will
+    // be called when a new connection is ready to be accepted, or when the
+    // acceptor has been closed. This lambda function is called our "handler"
+    // function (since it is called to handle new client connections). Normally
+    // we would put more of the logic below into the handler function, but we
+    // don't do that here primarily for readability and to avoid changing this
+    // code too much from previous examples.
+    //
+    // When we call `ioService_.run()`, the ``io_service` object processes
+    // serviceable event handlers, returning once there are no more handlers
+    // waiting. This ensures that `run()` will not return until all registered
+    // handlers (such as the function we registered for async_accept) have been
+    // called.
+    //
+    // We call `reset` on the `io_service` object because we need to reset its
+    // state to be able to call `run()` on it multiple times.
+    //
+    // Note that the approach shown here is much different than what you would
+    // find in Boost::Asio documentation. We choose this method to avoid use of
+    // the more sophisticated ASIO functionality and instead have things handled
+    // directly by threads.
+    boost::asio::ip::tcp::socket socket(ioService_);
+    boost::system::error_code acceptorError;
+    acceptor_.async_accept(
+        socket, [&acceptorError](const boost::system::error_code& error) {
+          acceptorError = error;
+        }
+    );
     LOG(INFO) << "Waiting for client to connect";
-    acceptor.accept(socket);
+    ioService_.reset();
+    ioService_.run();
+
+    // our handler function for async_accept must have been called, but it's
+    // possible that it was called because the acceptor was closed by
+    // Server::stop() or due to some other error
+    //
+    // check if the async_accept was cancelled or if the acceptor is closed
+    if (acceptorError == boost::asio::error::operation_aborted or
+        not acceptor_.is_open()) {
+      // looks like we need to shutdown -- break out of the loop
+      LOG(INFO) << "cancel() called or acceptor closed, breaking out of loop";
+      break;
+    }
+
+    // otherwise, if there's some other error, print it and also shutdown
+    if (acceptorError) {
+      LOG(ERROR)
+          << "Accept error: "
+          << boost::system::system_error(acceptorError).what()
+          << ", breaking out of loop";
+      break;
+    }
 
     // a client has connected
-    LOG(INFO) << "Processing new client connection";
-
     // determine the client's ID and create a ClientConnection object
     //
     // we use a shared_ptr so that both the client's thread and the main server
@@ -36,6 +89,7 @@ void Server::run(int32_t port) {
     const auto clientId = getNextClientID();
     const auto clientConn =
         std::make_shared<ClientConnection>(clientId, std::move(socket));
+    LOG(INFO) << "Processing new client connection, client ID = " << clientId;
 
     // add it to our map of clientId -> ClientConnection object
     {
@@ -45,10 +99,42 @@ void Server::run(int32_t port) {
 
     // create a std::thread object that executes Server::handleClient
     // we pass in `this` because we need to pass in the instance of the Server
-    // class to call a class function, and the clientConn structure
+    // class to call a class function, and the ClientConnection structure
+    //
+    // TODO: Periodic cleanup of thread objects in clientThreads_...
     clientThreads_.emplace_back(
         std::thread(&Server::handleClient, this, clientConn));
   }
+  LOG(INFO) << "Exited connection acceptance loop";
+
+  // disconnect remaining client connections
+  //
+  // we know that we're not going to accept any more clients, so just call
+  // getConnectedClients() to get all clientIds and then call disconnectClient()
+  // for each client ID
+  LOG(INFO) << "Cleaning up client connections";
+  const auto connectedClientIds = getConnectedClients();
+  for (const auto& clientId : connectedClientIds) {
+    // call disconnect
+    LOG(INFO) << "Disconnecting client " << clientId;
+    disconnectClient(clientId);
+  }
+
+  // wait for all client threads to cleanup by calling join() on each
+  LOG(INFO) << "Waiting for client threads to exit";
+  for (auto& clientThread : clientThreads_) {
+    clientThread.join();
+  }
+
+  // we're done -- all client connections were closed and threads joined
+  LOG(INFO) << "Finished shutting down server";
+}
+
+void Server::stop() {
+  // close the acceptor, which will cancel async_accept calls waiting on it
+  LOG(INFO) << "Closing acceptor, canceling all pending accept operations";
+  acceptor_.close();
+  LOG(INFO) << "Acceptor closed";
 }
 
 std::vector<int> Server::getConnectedClients() {
@@ -61,6 +147,24 @@ std::vector<int> Server::getConnectedClients() {
     }
   }
   return clientIds;
+}
+
+std::map<int, ClientRequestInfo> Server::getConnectedClientsWithInfo() {
+  std::map<int, ClientRequestInfo> clientIdToRequestInfo;
+  {
+    std::lock_guard<std::mutex> guard(clientConnectionsMutex_);
+    for (const auto& kv : clientConnections_) {
+      const auto& clientId = kv.first;
+      const auto& clientConn = kv.second;
+
+      // lock and copy the ClientRequestInfo structure
+      {
+        std::lock_guard<std::mutex> guard(clientConn->clientRequestInfoMutex);
+        clientIdToRequestInfo[clientId] = clientConn->clientRequestInfo;
+      }
+    }
+  }
+  return clientIdToRequestInfo;
 }
 
 bool Server::disconnectClient(const int clientId) {
@@ -166,11 +270,14 @@ void Server::handleClient(std::shared_ptr<ClientConnection> clientConn) {
   }
   inputFile.close();
 
+  // update the ClientRequestInfo structure
+  {
+    std::lock_guard<std::mutex> guard(clientConn->clientRequestInfoMutex);
+    clientConn->clientRequestInfo.filename = filename;
+    clientConn->clientRequestInfo.bytesToTransfer = inputFileBuf.size();
+  }
+
   // first send a message with the number of bytes in the file and a delimiter
-  // then send the actual bytes in the file (no delimiter)
-  // if we weren't able to read the file, inputFileBuf will be empty
-  //
-  // TODO(PA4): Add logic to rate limit based on token bucket
   sendBytes(
       clientConn->socket,
       std::to_string(inputFileBuf.size()) + kDelimiter, error);
@@ -181,13 +288,34 @@ void Server::handleClient(std::shared_ptr<ClientConnection> clientConn) {
         << boost::system::system_error(error).what();
     return;
   }
-  sendBytes(clientConn->socket, inputFileBuf, error);
-  if (error) {
-    LOG(ERROR)
-        << clientIdStr
-        << "Write error: "
-        << boost::system::system_error(error).what();
-    return;
+
+  // then send the actual bytes in the file (no delimiter)
+  // if we weren't able to read the file, inputFileBuf will be empty
+  //
+  // we send one byte at a time to slow down the send rate...
+  //
+  // TODO(PA4): Add logic to rate limit based on token bucket
+  for (unsigned int i = 0; i < inputFileBuf.size(); i++) {
+    // send a single byte
+    sendBytes(clientConn->socket, inputFileBuf.substr(i, 1), error);
+
+    // check for errors -- socket might have been closed while we were writing
+    if (error) {
+      LOG(ERROR)
+          << clientIdStr
+          << "Write error: "
+          << boost::system::system_error(error).what();
+      return;
+    }
+
+    // update the ClientRequestInfo structure
+    {
+      std::lock_guard<std::mutex> guard(clientConn->clientRequestInfoMutex);
+      clientConn->clientRequestInfo.bytesTransferred++;
+    }
+
+    // wait before sending the next byte
+    std::this_thread::sleep_for(std::chrono::milliseconds(FLAGS_send_delay_ms));
   }
   LOG(INFO)
       << clientIdStr

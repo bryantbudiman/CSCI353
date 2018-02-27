@@ -68,7 +68,10 @@ void runServer() {
 
   // create a thread that calls Server::run
   std::thread serverThread([&server](){
-      server.run(FLAGS_port);
+    // create endpoint to listen on
+    const boost::asio::ip::tcp::endpoint endpoint(
+        boost::asio::ip::tcp::v4(), FLAGS_port);
+    server.run(endpoint);
   });
 
   // create a thread with simple logic that operates on the server
@@ -77,15 +80,26 @@ void runServer() {
 
   // wait on the terminal thread to exit
   terminalThread.join();
+  LOG(INFO) << "Terminal thread returned" << std::endl;
 
-  // TODO: Shutdown the server connections
+  // the terminal thread will exit if "shutdown" is called
+  // at this point, we call shutdown on the server
+  LOG(INFO) << "Shutting down server";
+  std::cout << "Shutting down server" << std::endl;
+  server.stop();
 
   // wait on the server thread to exit
+  LOG(INFO) << "Waiting on server thread(s) to shutdown";
   serverThread.join();
+
+  // done
+  LOG(INFO) << "Exiting";
+  std::cout << "Exiting" << std::endl;
 }
 
 void runServerTerminal(Server& server) {
-  // loop forever
+  std::cout << "Starting server terminal..." << std::endl;
+  // loop until "shutdown" is called
   while (true) {
     std::cout << "#> " << std::flush;
     std::string command;
@@ -96,31 +110,45 @@ void runServerTerminal(Server& server) {
     boost::split(commandFields, command, boost::is_any_of(" "));
 
     // handle empty line
-    if (commandFields.empty()) {
+    if (commandFields.empty() || command.empty()) {
       continue;
     }
 
     // handle "list" command
     if (commandFields[0] == "list") {
-      auto clientIds = server.getConnectedClients();
+      const auto clientIdToRequestInfo = server.getConnectedClientsWithInfo();
 
-      // sort the client IDs
-      std::sort(clientIds.begin(), clientIds.end());
-
-      // print as "Connected clients = 10, 11, 12"
-      std::cout << "Connected clients = ";
-      bool firstClient = true;
-      for (const auto& clientId : clientIds) {
-        if (not firstClient) {
-          // add separator
-          std::cout << ", ";
+      // print as the following:
+      //
+      // Connected clients:
+      //  - Client ID <#> | filename = <filename> | transferred X out of Y bytes
+      //  ...
+      if (clientIdToRequestInfo.empty()) {
+        std::cout << "No clients currently connected" << std::endl;
+      } else {
+        std::cout << "-------------------------------------------" << std::endl;
+        std::cout << "Connected clients:" << std::endl;
+        for (const auto& kv : clientIdToRequestInfo) {
+          const auto& clientId = kv.first;
+          const auto& requestInfo = kv.second;
+          const auto& filename =
+              (requestInfo.filename.empty()) ? "<not set>" : requestInfo.filename;
+          const auto& bytesTransferred = requestInfo.bytesTransferred;
+          const auto& bytesToTransfer = requestInfo.bytesToTransfer;
+          std::cout
+              << " - Client ID "  << clientId
+              << " | filename = " << filename
+              << " | transferred " << bytesTransferred
+              << " out of " << bytesToTransfer
+              << " bytes"
+              << std::endl;
         }
-        std::cout << clientId;
+        std::cout << "-------------------------------------------" << std::endl;
       }
-      std::cout << std::endl;
+      continue;
     }
 
-    // handle "list" command
+    // handle "disconnect" command
     if (commandFields[0] == "disconnect") {
       // make sure there's a client ID specified
       if (commandFields.size() != 2) {
@@ -145,7 +173,18 @@ void runServerTerminal(Server& server) {
       } else {
         std::cout << "Unable to disconnect client ID " << clientId << std::endl;
       }
+
+      continue;
     }
+
+    // handle "shutdown" command
+    if (commandFields[0] == "shutdown") {
+      std::cout << "Exiting server terminal" << std::endl;
+      break;
+    }
+
+    // if we got here, we didn't handle the command
+    std::cout << "Unknown command \"" << commandFields[0] << "\"" << std::endl;
   }
 }
 
